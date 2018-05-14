@@ -126,23 +126,24 @@ function rolebasedpricing_civicrm_postProcess($formName, &$form) {
     $participantRoles = $form->getElement('participant_roles')->getValue();
 
     if ($price_field_id) {
-      $fieldID = CRM_Core_DAO::getFieldValue('CRM_Price_DAO_PriceFieldValue', $price_field_id, 'id', 'price_field_id');
-    }
+      $query = "select id from civicrm_price_field_value where price_field_id = %1";
+      $dao   = CRM_Core_DAO::executeQuery($query, array(1 => array($price_field_id, 'Integer')));
+      while($dao->fetch()) {
+        $fieldID = $dao->id;
+        //delete any records with this field id first
+        $sql = "DELETE FROM civicrm_participantrole_price WHERE field_id= %1";
+        $delparams = array(1 => array($fieldID, 'Integer'));
+        CRM_Core_DAO::executeQuery($sql, $delparams);
 
-    if ($fieldID) {
-      //delete any records with this field id first
-      $sql = "DELETE FROM civicrm_participantrole_price WHERE field_id= %1";
-      $delparams = array(1 => array($fieldID, 'Integer'));
-      CRM_Core_DAO::executeQuery($sql, $delparams);
-
-      if (!empty ($participantRoles)) {
-        foreach ($participantRoles as $participantRoleId) {
-          //insert new records
-          $sql = "INSERT INTO civicrm_participantrole_price (participant_role, price_field_id, field_id) VALUES (%1, %2, %3)";
-          $params = array(1 => array((int)$participantRoleId, 'Integer'),
-            2 => array((int)$price_field_id, 'Integer'),
-            3 => array((int)$fieldID, 'Integer'));
-          CRM_Core_DAO::executeQuery($sql, $params);
+        if (!empty ($participantRoles)) {
+          foreach ($participantRoles as $participantRoleId) {
+            //insert new records
+            $sql = "INSERT INTO civicrm_participantrole_price (participant_role, price_field_id, field_id) VALUES (%1, %2, %3)";
+            $params = array(1 => array((int)$participantRoleId, 'Integer'),
+              2 => array((int)$price_field_id, 'Integer'),
+              3 => array((int)$fieldID, 'Integer'));
+            CRM_Core_DAO::executeQuery($sql, $params);
+          }
         }
       }
     }
@@ -203,13 +204,16 @@ function rolebasedpricing_civicrm_buildAmount($pageType, &$form, &$amount) {
             3 => array((int)$fieldID, 'Integer'));
 
             $founInPriceRoleSetting = CRM_Core_DAO::singleValueQuery($sql, $params);
-            if ($founInPriceRoleSetting == 1) {
+            // DS: to make it work for event session extension, we skip unset, 
+            // if amount is 0, amount <= 0 which is what sessions are assumed to be.
+            if ($founInPriceRoleSetting == 1 || $option['amount'] <= 0) {
               $counter++;
             }
             else {
               unset($feeBlock[$k]);
               //unsetting it from $form->priceSet as it leaves the labels of Price Options behind
               unset($priceSet['fields'][$price_field_id]);
+              CRM_Core_Error::debug_log_message("PriceSet ID {$priceSetId} - Removed price field '{$fee['label']}' because either no match found in table civicrm_participantrole_price for participant_role={$participantrole}, price_field_id={$price_field_id}, field_id={$fieldID} OR option[amount] ({$option['amount']}) was <= 0");
             }
           }
         }
@@ -235,11 +239,12 @@ function rolebasedpricing_civicrm_install() {
       `participant_role` int(11) unsigned NOT NULL,
       `price_field_id` int(11) unsigned NOT NULL,
       `field_id` int(11) unsigned NOT NULL,
-      PRIMARY KEY (`id`)
+      PRIMARY KEY (`id`),
+      UNIQUE KEY UI_role_price_field (participant_role, price_field_id, field_id)
     )",
     "ALTER TABLE `civicrm_participantrole_price`
-      ADD CONSTRAINT `civicrm_participantrole_price_fk_2` FOREIGN KEY (`price_field_id`) REFERENCES `civicrm_price_field` (`id`),
-      ADD CONSTRAINT `civicrm_participantrole_price_fk_1` FOREIGN KEY (`field_id`) REFERENCES `civicrm_price_field_value` (`id`);"
+      ADD CONSTRAINT `civicrm_participantrole_price_fk_2` FOREIGN KEY (`price_field_id`) REFERENCES `civicrm_price_field` (`id`) ON DELETE CASCADE,
+      ADD CONSTRAINT `civicrm_participantrole_price_fk_1` FOREIGN KEY (`field_id`) REFERENCES `civicrm_price_field_value` (`id`) ON DELETE CASCADE;"
   );
 
   foreach ($sql as $query) {
@@ -276,4 +281,31 @@ function rolebasedpricing_getParticipantRole($fieldId) {
     array_push($result['pids'], $dao->participant_role);
   }
   return $result;
+}
+
+/**
+ * Implements hook_civicrm_copy(().
+ *
+ * Copy over rolebasedpricing when priceset is copied.
+ *
+ */
+function rolebasedpricing_civicrm_copy($objectName, &$object) {
+  $sid = CRM_Utils_Request::retrieve('sid', 'Positive', CRM_Core_DAO::$_nullObject, FALSE, NULL, 'GET');
+  if ($objectName == 'Set' && $sid && $object->id) {
+    $sql = "INSERT INTO civicrm_participantrole_price (participant_role, price_field_id, field_id)
+      SELECT rp1.participant_role, rp2_pfid.id, rp2_fid.id 
+      FROM       civicrm_participantrole_price rp1 
+      INNER JOIN civicrm_price_field rp1_pfid ON rp1.price_field_id = rp1_pfid.id
+      INNER JOIN civicrm_price_set   rp1_ps   ON rp1_pfid.price_set_id = rp1_ps.id
+      INNER JOIN civicrm_price_field rp2_pfid ON rp2_pfid.price_set_id = %1 AND rp1_pfid.name = rp2_pfid.name
+      INNER JOIN civicrm_price_field_value rp1_fid ON rp1.field_id = rp1_fid.id
+      INNER JOIN civicrm_price_field_value rp2_fid ON rp2_fid.price_field_id = rp2_pfid.id AND rp1_fid.name = rp2_fid.name
+      WHERE rp1_ps.id = %2";
+    $sqlParams = array(
+      1 => array($object->id, 'Positive'),
+      2 => array($sid, 'Positive'),
+    );
+    CRM_Core_DAO::executeQuery($sql, $sqlParams);
+    CRM_Core_Error::debug_log_message("PriceSet rolebasedpricing copied from PSID:{$sid} to PSID:{$object->id}");
+  }
 }
